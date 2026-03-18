@@ -86,6 +86,21 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Test-time training (LoRA) hyperparameters.
+    ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 8))
+    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.01))
+    ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 256))
+    ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 1024))
+    ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
+
+    # QAT: fake int8 quantization during training to reduce post-quant degradation.
+    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
+    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.75))
+    qat_ramp_frac = float(os.environ.get("QAT_RAMP_FRAC", 0.05))
+
+    # Cosine warmdown instead of linear.
+    cosine_warmdown = bool(int(os.environ.get("COSINE_WARMDOWN", "1")))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -513,6 +528,35 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+def _fake_quantize_weight_inplace(w: Tensor) -> Tensor:
+    """Simulate per-row int8 quantization on a 2D weight, returning the dequantized version."""
+    w32 = w.float()
+    amax = w32.abs().amax(dim=1).clamp_min(1e-12)
+    scale = amax / 127.0
+    q = torch.clamp(torch.round(w32 / scale[:, None]), -127, 127)
+    return (q * scale[:, None]).to(w.dtype)
+
+
+def _apply_qat_noise(base_model: nn.Module, alpha: float) -> list[tuple[nn.Parameter, Tensor]]:
+    """Replace large matrix weights with quantized versions. Returns originals for restore."""
+    saved: list[tuple[nn.Parameter, Tensor]] = []
+    with torch.no_grad():
+        for p in base_model.parameters():
+            if p.ndim == 2 and p.numel() > INT8_KEEP_FLOAT_MAX_NUMEL:
+                orig = p.data.clone()
+                w_q = _fake_quantize_weight_inplace(p.data)
+                p.data.lerp_(w_q, alpha)
+                saved.append((p, orig))
+    return saved
+
+
+def _restore_qat_weights(saved: list[tuple[nn.Parameter, Tensor]]) -> None:
+    """Restore original weights after a QAT forward+backward pass."""
+    with torch.no_grad():
+        for p, orig in saved:
+            p.data.copy_(orig)
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -908,6 +952,8 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(f"qat_enabled:{args.qat_enabled} qat_start_frac:{args.qat_start_frac} qat_ramp_frac:{args.qat_ramp_frac}")
+    log0(f"cosine_warmdown:{args.cosine_warmdown}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -926,11 +972,21 @@ def main() -> None:
             return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+            if warmdown_start <= step < args.iterations:
+                t = max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
+                if args.cosine_warmdown:
+                    return 0.5 * (1.0 + math.cos(math.pi * (1.0 - t)))
+                return t
+            return 1.0
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        if remaining_ms <= warmdown_ms:
+            t = remaining_ms / max(warmdown_ms, 1e-9)
+            if args.cosine_warmdown:
+                return 0.5 * (1.0 + math.cos(math.pi * (1.0 - t)))
+            return t
+        return 1.0
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1006,16 +1062,30 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+
+        # QAT: compute alpha for fake quantization ramp.
+        qat_alpha = 0.0
+        if args.qat_enabled:
+            if max_wallclock_ms is not None and max_wallclock_ms > 0:
+                train_frac = elapsed_ms / max_wallclock_ms
+            else:
+                train_frac = step / max(args.iterations, 1)
+            if train_frac >= args.qat_start_frac:
+                qat_alpha = min((train_frac - args.qat_start_frac) / max(args.qat_ramp_frac, 1e-9), 1.0)
+
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            saved_weights = _apply_qat_noise(base_model, qat_alpha) if qat_alpha > 0 else []
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
+            if saved_weights:
+                _restore_qat_weights(saved_weights)
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
@@ -1040,9 +1110,11 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            qat_str = f" qat_alpha:{qat_alpha:.3f}" if args.qat_enabled and qat_alpha > 0 else ""
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"{qat_str}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
