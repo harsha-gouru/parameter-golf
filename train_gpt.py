@@ -101,6 +101,11 @@ class Hyperparameters:
     # Cosine warmdown instead of linear.
     cosine_warmdown = bool(int(os.environ.get("COSINE_WARMDOWN", "1")))
 
+    # Depth recurrence: loop unique_blocks N times to get effective_layers = unique_blocks * recurrence.
+    # E.g. NUM_LAYERS=3, DEPTH_RECURRENCE=3 → 3 unique blocks looped 3x = 9 effective layers.
+    # Set to 1 (default) for standard behavior (no looping).
+    depth_recurrence = int(os.environ.get("DEPTH_RECURRENCE", 1))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -703,6 +708,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        depth_recurrence: int = 1,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -710,9 +716,15 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.depth_recurrence = max(depth_recurrence, 1)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
+
+        # num_layers = number of unique block modules.
+        # effective_layers = num_layers * depth_recurrence (total forward passes through blocks).
+        self.num_unique_layers = num_layers
+        effective_layers = num_layers * self.depth_recurrence
+        self.num_encoder_layers = effective_layers // 2
+        self.num_decoder_layers = effective_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
@@ -741,7 +753,11 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def _get_block(self, effective_idx: int) -> Block:
+        """Map effective layer index to a unique block (with wrapping for recurrence)."""
+        return self.blocks[effective_idx % self.num_unique_layers]
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor, lora=None) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -749,12 +765,17 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            qd = lora.q_loras[i] if lora else None
+            vd = lora.v_loras[i] if lora else None
+            x = self._get_block(i)(x, x0, qd, vd)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            bi = self.num_encoder_layers + i
+            qd = lora.q_loras[bi] if lora else None
+            vd = lora.v_loras[bi] if lora else None
+            x = self._get_block(bi)(x, x0, qd, vd)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -879,6 +900,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        depth_recurrence=args.depth_recurrence,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -937,7 +959,8 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    log0(f"model_params:{n_params}")
+    effective_layers = base_model.num_encoder_layers + base_model.num_decoder_layers
+    log0(f"model_params:{n_params} unique_layers:{base_model.num_unique_layers} effective_layers:{effective_layers} depth_recurrence:{args.depth_recurrence}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")

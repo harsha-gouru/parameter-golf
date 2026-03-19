@@ -1,0 +1,9 @@
+{
+    "_name": "depth_rec_3x5_wide",
+    "_description": "3 blocks x5 = 15 eff layers, wider (896 dim) to fill 16MB budget",
+    "NUM_LAYERS": 3,
+    "DEPTH_RECURRENCE": 5,
+    "MODEL_DIM": 896,
+    "NUM_HEADS": 14,
+    "NUM_KV_HEADS": 7
+}

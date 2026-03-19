@@ -1,0 +1,7 @@
+{
+    "_name": "higher_lr",
+    "_description": "More aggressive learning rates — see if baseline is undertrained",
+    "MATRIX_LR": 0.06,
+    "SCALAR_LR": 0.06,
+    "TIED_EMBED_LR": 0.08
+}

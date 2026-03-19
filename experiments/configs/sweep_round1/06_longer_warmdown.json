@@ -1,0 +1,5 @@
+{
+    "_name": "longer_warmdown",
+    "_description": "Longer warmdown — 2000 iters instead of 1200",
+    "WARMDOWN_ITERS": 2000
+}

@@ -1,0 +1,8 @@
+{
+    "_name": "wider_model",
+    "_description": "Wider model (640 dim) with fewer layers to stay under 16MB",
+    "MODEL_DIM": 640,
+    "NUM_LAYERS": 6,
+    "NUM_HEADS": 10,
+    "NUM_KV_HEADS": 5
+}
