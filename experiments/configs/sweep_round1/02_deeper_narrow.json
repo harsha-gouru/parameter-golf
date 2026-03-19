@@ -1,0 +1,8 @@
+{
+    "_name": "deeper_narrow",
+    "_description": "Deeper (15 layers) but narrower (384 dim) — more depth, same param budget",
+    "MODEL_DIM": 384,
+    "NUM_LAYERS": 15,
+    "NUM_HEADS": 6,
+    "NUM_KV_HEADS": 3
+}

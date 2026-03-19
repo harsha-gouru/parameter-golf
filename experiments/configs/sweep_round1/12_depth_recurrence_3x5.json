@@ -1,0 +1,9 @@
+{
+    "_name": "depth_rec_3x5",
+    "_description": "3 unique blocks looped 5x = 15 effective layers. Much deeper with same params.",
+    "NUM_LAYERS": 3,
+    "DEPTH_RECURRENCE": 5,
+    "MODEL_DIM": 768,
+    "NUM_HEADS": 12,
+    "NUM_KV_HEADS": 4
+}
