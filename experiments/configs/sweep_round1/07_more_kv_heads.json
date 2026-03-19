@@ -1,0 +1,7 @@
+{
+    "_name": "full_mha_narrow",
+    "_description": "Full multi-head attention (no GQA) with narrower dim to fit budget",
+    "NUM_KV_HEADS": 8,
+    "MODEL_DIM": 448,
+    "NUM_HEADS": 8
+}

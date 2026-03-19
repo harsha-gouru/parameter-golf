@@ -1,0 +1,9 @@
+{
+    "_name": "mlp_3x_expansion",
+    "_description": "3x MLP expansion — wider FFN, fewer layers to fit budget",
+    "MLP_MULT": 3,
+    "NUM_LAYERS": 7,
+    "MODEL_DIM": 448,
+    "NUM_HEADS": 8,
+    "NUM_KV_HEADS": 4
+}
