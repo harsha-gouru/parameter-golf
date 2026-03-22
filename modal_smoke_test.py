@@ -361,7 +361,7 @@ def train_8gpu(
         "ITERATIONS": "20000",
         "MAX_WALLCLOCK_SECONDS": "600",
         "WARMUP_STEPS": "20",
-        "WARMDOWN_ITERS": "3000",
+        "WARMDOWN_ITERS": "2800",
         "TRAIN_BATCH_TOKENS": "786432",
         "TRAIN_SEQ_LEN": "2048",
         "TRAIN_LOG_EVERY": "100",

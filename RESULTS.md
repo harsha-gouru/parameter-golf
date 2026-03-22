@@ -4,6 +4,9 @@
 - **SOTA (leaderboard #1):** 1.14276 bpb (thwu1, 10L int5/int6 + BigramHash + SWA)
 - **Baseline:** 1.22437 bpb (naive 9L int8+zlib)
 - **Our best:** 1.15711 bpb (10L, count-init bigram logit head, learnable QAT)
+- **Latest (v3):** 1.15776 bpb (fast CastedLinear path, warmdown=2800, 23 SWA checkpoints)
+- **Gap to SOTA:** 0.015 bpb
+- **Open PR #434:** 1.1370 bpb (would be new #1 if merged — uses XSA + LeakyReLU² + Partial RoPE)
 
 ## Our Submission Architecture
 
@@ -123,6 +126,127 @@ HEADROOM: 1,016,285 bytes (1.02 MB)
 | 10L 5000-step | 5000 | 1×H100 | Full | 14.57 MB | 1.4668 | PASS |
 | 11L 5000-step | 5000 | 1×H100 | Full + 11L | 15.93 MB | 1.4600 | PASS (8KB room) |
 | **8×H100 full** | **~6300** | **8×H100** | **Full competition** | **14.92 MB** | **1.1571** | **PASS (1.02 MB room)** |
+
+## 8×H100 Run v2 — Tuned (2026-03-22)
+
+**Run ID:** `sub-10L-v2-tuned`
+**Changes from v1:** Warmdown 3000→1500, added BigramHash(4096) back alongside bigram logit head
+
+### Results
+```
+val_bpb: 1.15872 (WORSE than v1)
+Artifact: 15.23 MB (+0.31 MB from BigramHash)
+Steps: 6321 at 95ms/step
+SWA: 12 checkpoints
+QAT gammas: all 1.000 (didn't learn)
+```
+
+### Takeaways
+- **BigramHash(4096) alongside exact bigram head provides no benefit** — confirmed redundant
+- Warmdown=1500 was too short (23.7% of training vs SOTA's 44.5%)
+- QAT gammas didn't learn — start_frac=0.85 + recompile overhead leaves too few steps
+
+---
+
+## 8×H100 Run v3 — Fast Path + Warmdown Fix (2026-03-22)
+
+**Run ID:** `sub-10L-v3-tuned`
+**Changes from v2:**
+- Fast CastedLinear path: skip `.float()` + dict lookup when QAT off (matches SOTA speed)
+- Removed BigramHash (confirmed redundant)
+- Warmdown 1500→2800 (matches SOTA's ~45% warmdown ratio)
+
+### Training Log
+```
+CUDA devices: 8× NVIDIA H100 80GB HBM3
+Compilation: ~150s
+
+step:1000  train_loss:2.3067  step_avg:93.52ms
+step:2000  train_loss:2.1574  step_avg:93.53ms
+step:3000  val_bpb:1.2558
+step:4000  train_loss:2.0569  step_avg:93.56ms
+step:5000  val_bpb:1.2128
+step:6000  val_bpb:1.1751  step_avg:93.58ms
+step:6410  val_bpb:1.1639  (wallclock cap)
+
+SWA: 23 checkpoints averaged
+QAT gammas: min=1.000 max=1.000 (still not learning)
+```
+
+### Results
+```
+final val_bpb: 1.15776
+Artifact: 15,036,400 bytes (15.04 MB)
+Headroom: 0.90 MB
+Steps: 6410 at 93.6ms/step
+```
+
+### Comparison
+
+| Metric | v1 | v2 | v3 | SOTA (thwu1) |
+|--------|----|----|----|----|
+| val_bpb | 1.1571 | 1.1587 | 1.1578 | **1.1428** |
+| Steps | ~6300 | 6321 | 6410 | 6709 |
+| Step time | 95ms | 95ms | 93.6ms | 89ms |
+| SWA ckpts | 12 | 12 | 23 | — |
+| Gammas learned | YES | no | no | — |
+| Artifact | 14.92 MB | 15.23 MB | 15.04 MB | 15.97 MB |
+
+### Takeaways
+1. **Step time improved 95→93.6ms** — fast CastedLinear path saves ~1.5ms/step
+2. **SWA 23 checkpoints** — more averaging material with warmdown=2800
+3. **Still 0.015 gap to SOTA** — we're stuck at ~1.157
+4. **QAT gammas not learning on 8-GPU** — works on single-GPU (gammas reached 0.85) but not on 8×H100. Likely a torch.compile recompilation issue when QAT activates.
+5. **Bigram logit head adds ~4ms/step overhead** — 93.6ms vs SOTA's 89ms. The table lookup is more expensive than BigramHash's small embedding lookup.
+
+### Root Cause Analysis: Why 0.015 Gap Remains
+
+| Factor | Impact | Evidence |
+|--------|--------|----------|
+| **~300 fewer steps** | ~0.005 bpb | 6410 vs 6709 steps (93.6ms vs 89ms per step) |
+| **QAT not learning on 8-GPU** | ~0.003 bpb | Single-GPU: gamma=0.85 improved quant gap. 8-GPU: all 1.0 |
+| **No BigramHash** | ~0.003 bpb | SOTA uses 10240 buckets in hidden state; we replaced with logit head |
+| **Compilation overhead** | ~0.002 bpb | 150s compile = fewer training steps than SOTA |
+| **Different architecture** | ~0.002 bpb | Count-init bigram logit head vs BigramHash — different trade-offs |
+
+### Options to Close the Gap
+
+**Option A: Match SOTA architecture, add our quant improvements**
+- Revert to BigramHash(10240), remove bigram logit head
+- Keep int5/int6 + learnable QAT + SWA + all SOTA tricks
+- Expected: match SOTA step time (89ms), get 6700+ steps
+- Risk: lose the bigram logit head advantage (if any)
+
+**Option B: Fix QAT on 8-GPU**
+- Precompile both QAT and non-QAT paths during warmup
+- Lower qat_start_frac to 0.70 (more QAT steps)
+- Expected: gammas learn like single-GPU, quant gap closes
+- Risk: recompile still eats steps
+
+**Option C: Study PR #434 (1.1370) and adopt their tricks**
+- XSA (Xtra-Short Attention?), LeakyReLU², Partial RoPE
+- These are novel architectural changes we haven't tried
+- Expected: potentially large gains if techniques are additive
+- Risk: unknown, need to read their code
+
+**Option D: 11L with tight budget management**
+- 11L got 1.4600 on 5K single-GPU (vs 10L at 1.4668)
+- 8KB headroom on 5% pruning — risky but possible
+- Expected: ~0.005-0.010 bpb improvement from depth
+- Risk: over 16MB limit
+
+---
+
+## Total Spend
+
+| Run | GPU | Duration | Estimated Cost |
+|-----|-----|----------|----------------|
+| Smoke tests (v1-v8, ~8 runs) | 1×H100 | ~25 min total | ~$2 |
+| 5K-step tests (2 runs) | 1×H100 | ~35 min total | ~$3 |
+| 8×H100 v1 | 8×H100 | ~15 min | ~$8 |
+| 8×H100 v2 | 8×H100 | ~15 min | ~$8 |
+| 8×H100 v3 | 8×H100 | ~15 min | ~$8 |
+| **Total** | — | — | **~$29** |
 
 ## Infrastructure
 

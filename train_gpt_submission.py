@@ -560,9 +560,12 @@ def _fake_quant_with_gamma(w: Tensor, theta: Tensor, qn: int, qp: int) -> Tensor
 
 # Global QAT state: id(module) -> (theta, qn, qp)
 _qat_state: dict[int, tuple[Tensor, int, int]] = {}
+_qat_global_active = False  # fast flag to avoid dict lookup when QAT off
 
 def set_qat_mode(base_model: nn.Module, clip_gammas: dict[str, Tensor], active: bool) -> None:
     """Toggle QAT on/off for all quantizable modules."""
+    global _qat_global_active
+    _qat_global_active = active
     _qat_state.clear()
     if not active:
         return
@@ -580,12 +583,17 @@ def set_qat_mode(base_model: nn.Module, clip_gammas: dict[str, Tensor], active: 
 
 class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
-        w = self.weight.float()  # fake-quant in fp32
-        qat = _qat_state.get(id(self))
-        if qat is not None:
-            theta, qn, qp = qat
-            w = _fake_quant_with_gamma(w, theta, qn, qp)
-        w = w.to(x.dtype)
+        if _qat_global_active:
+            # QAT path: fp32 fake-quant then cast down
+            w = self.weight.float()
+            qat = _qat_state.get(id(self))
+            if qat is not None:
+                theta, qn, qp = qat
+                w = _fake_quant_with_gamma(w, theta, qn, qp)
+            w = w.to(x.dtype)
+        else:
+            # Fast path: direct cast (matches SOTA speed)
+            w = self.weight.to(x.dtype)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
 
@@ -1369,7 +1377,6 @@ def main() -> None:
         base_model.load_state_dict(avg_state, strict=True)
 
     # Disable QAT before serialization and eval
-    _qat_state.clear()
     set_qat_mode(base_model, clip_gammas, False)
 
     # Extract learned gammas for final quantization
