@@ -130,9 +130,8 @@ def train(
     model_dim: int = 512,
     mlp_mult: str = "3",
     # Our features
-    bigram_logit: bool = True,
+    bigram_logit: bool = False,
     # Eval
-    swa_enabled: bool = False,
     eval_stride: int = 0,
 ):
     """Run training on a single H100. Data must already be cached."""
@@ -202,22 +201,24 @@ def train(
         "TRAIN_LOG_EVERY": "10",
         "VAL_LOSS_EVERY": str(max(max_steps // 4, 50)),
         # Optimizer
-        "MATRIX_LR": "0.02",
-        "SCALAR_LR": "0.02",
-        "TIED_EMBED_LR": "0.03",
+        "MATRIX_LR": "0.025",
+        "SCALAR_LR": "0.025",
+        "TIED_EMBED_LR": "0.035",
         "WEIGHT_DECAY": "0.04",
         "MUON_MOMENTUM": "0.99",
         "MUON_MOMENTUM_WARMUP_START": "0.92",
         "MUON_MOMENTUM_WARMUP_STEPS": "300",
         "GRAD_CLIP_NORM": "0.3",
         # N-gram embeddings
-        "BIGRAM_VOCAB_SIZE": "10240",
+        "BIGRAM_VOCAB_SIZE": "4096",
         "BIGRAM_DIM": "128",
         "BIGRAM_LOGIT_HEAD": "1" if bigram_logit else "0",
-        # QAT (disable for short smoke tests — compile overhead too high)
-        "QAT_ENABLED": "0" if max_steps <= 500 else "1",
-        # Eval
-        "SWA_ENABLED": "1" if swa_enabled else "0",
+        # Architectural improvements
+        "XSA_LAST_N": "4",
+        "ROPE_DIMS": "16",
+        "LN_SCALE": "1",
+        # Eval (disable EMA for short smoke tests — needs 1000+ steps)
+        "EMA_ENABLED": "1" if max_steps >= 1000 else "0",
         "EVAL_STRIDE": str(eval_stride),
     })
 
@@ -231,8 +232,8 @@ def train(
     print(f"RUN: {run_id}")
     print(f"  arch: {num_layers}L, dim={model_dim}, mlp={mlp_mult}, heads=8/4")
     print(f"  training: {max_steps} steps, {max_wallclock}s wallclock, batch=65K, seq=1024")
-    print(f"  features: bigram_logit={bigram_logit}, bigram_hash(10240), qat=enabled")
-    print(f"  eval: swa={swa_enabled}, sliding_stride={eval_stride}")
+    print(f"  features: bigram_logit={bigram_logit}, BigramHash(2048), XSA4, PartialRoPE16, LN_Scale, EMA")
+    print(f"  eval: sliding_stride={eval_stride}")
     print(f"{'='*80}\n")
 
     t_start = time.time()
@@ -315,8 +316,7 @@ def train_8gpu(
     num_layers: int = 10,
     model_dim: int = 512,
     mlp_mult: str = "3",
-    bigram_logit: bool = True,
-    qat_start_frac: float = 0.85,
+    bigram_logit: bool = False,
 ):
     """Full 10-min training on 8×H100 with torchrun DDP."""
     import os
@@ -367,9 +367,9 @@ def train_8gpu(
         "TRAIN_LOG_EVERY": "100",
         "VAL_LOSS_EVERY": "500",
         # Optimizer
-        "MATRIX_LR": "0.02",
-        "SCALAR_LR": "0.02",
-        "TIED_EMBED_LR": "0.03",
+        "MATRIX_LR": "0.025",
+        "SCALAR_LR": "0.025",
+        "TIED_EMBED_LR": "0.035",
         "WEIGHT_DECAY": "0.04",
         "MUON_MOMENTUM": "0.99",
         "MUON_MOMENTUM_WARMUP_START": "0.92",
@@ -377,11 +377,12 @@ def train_8gpu(
         "GRAD_CLIP_NORM": "0.3",
         # Features
         "BIGRAM_LOGIT_HEAD": "1" if bigram_logit else "0",
-        "BIGRAM_VOCAB_SIZE": "10240",
+        "BIGRAM_VOCAB_SIZE": "4096",
         "BIGRAM_DIM": "128",
-        # QAT
-        "QAT_ENABLED": "1",
-        "QAT_START_FRAC": str(qat_start_frac),
+        # Architectural improvements
+        "XSA_LAST_N": "4",
+        "ROPE_DIMS": "16",
+        "LN_SCALE": "1",
         # Eval
         "SWA_ENABLED": "1",
         "SWA_START_FRAC": "0.4",
@@ -394,7 +395,7 @@ def train_8gpu(
     print(f"FULL 8×H100 RUN: {run_id}")
     print(f"  arch: {num_layers}L, dim={model_dim}, mlp={mlp_mult}")
     print(f"  training: 20K iters, 600s wallclock, batch=786K, seq=2048")
-    print(f"  features: bigram_logit={bigram_logit}, SWA, sliding_eval=64, QAT@{qat_start_frac}")
+    print(f"  features: bigram_logit={bigram_logit}, BigramHash(2048), XSA4, PartialRoPE16, LN_Scale, EMA")
     print(f"{'='*80}\n")
 
     # Verify GPUs before launching torchrun
@@ -551,7 +552,6 @@ def main(
         model_dim=model_dim,
         mlp_mult=mlp_mult,
         bigram_logit=not no_bigram_logit,
-        swa_enabled=full,
         eval_stride=64 if full else 0,
     )
 

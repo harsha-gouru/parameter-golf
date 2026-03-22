@@ -69,10 +69,10 @@ class Hyperparameters:
 
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.03))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.035))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.02))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
@@ -86,21 +86,23 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
     swa_every = int(os.environ.get("SWA_EVERY", 50))
 
-    # Exact bigram logit head (replaces BigramHash when enabled)
-    bigram_logit_head = bool(int(os.environ.get("BIGRAM_LOGIT_HEAD", "1")))
+    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
 
-    # QAT with learnable clip multipliers
-    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
-    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.85))
-    qat_gamma_lr = float(os.environ.get("QAT_GAMMA_LR", 0.01))
-    qat_gamma_reg = float(os.environ.get("QAT_GAMMA_REG", 0.01))
+    # Exact bigram logit head (replaces BigramHash when enabled)
+    bigram_logit_head = bool(int(os.environ.get("BIGRAM_LOGIT_HEAD", "0")))
+
+    # Architectural improvements from top PRs
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))       # XSA on last N layers
+    rope_dims = int(os.environ.get("ROPE_DIMS", 16))         # Partial RoPE: rotate this many dims
+    ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))    # RMSNorm scale by 1/sqrt(layer+1)
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -354,7 +356,6 @@ def quantize_intN_per_row(t: Tensor, clip_range: int = 31, gamma: float = 1.0) -
     return q, scale
 
 def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str],
-                         learned_gammas: dict[str, float] | None = None,
                          int4_names: set[str] | None = None):
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
@@ -374,7 +375,7 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str],
             result[name] = t.to(dtype=torch.float16).contiguous()
             meta[name] = "passthrough_fp16"
             continue
-        gamma = learned_gammas.get(name, 1.0) if learned_gammas else 1.0
+        gamma = 1.0
         # Int4 nibble-packed path
         if name in int4_names and t.ndim >= 1:
             q, s = quantize_intN_per_row(t, clip_range=7, gamma=gamma)
@@ -533,67 +534,9 @@ def unpack_i4(packed: Tensor, numel: int) -> Tensor:
     q = torch.where(q >= 8, q - 16, q)
     return q.to(torch.int8).contiguous()
 
-# -----------------------------
-# QAT WITH LEARNABLE CLIP MULTIPLIERS
-# -----------------------------
-
-_QAT_CLIP_MIN_NUMEL = 65_536
-
-def _ste_round(x: Tensor) -> Tensor:
-    """Round with straight-through estimator."""
-    return (x.round() - x).detach() + x
-
-def _get_quant_range(name: str) -> tuple[int, int]:
-    if ".mlp." in name:
-        return -16, 15  # int5
-    if "bigram_logit" in name:
-        return -8, 7   # int4
-    return -32, 31  # int6
-
-def _fake_quant_with_gamma(w: Tensor, theta: Tensor, qn: int, qp: int) -> Tensor:
-    """Fake-quantize with learnable clip multiplier. gamma = 0.5 + sigmoid(theta)."""
-    gamma = 0.5 + torch.sigmoid(theta)
-    amax = w.detach().abs().amax(dim=1, keepdim=True).clamp_min(1e-8)
-    scale = gamma * amax / float(qp)
-    u = (w / scale).clamp(qn, qp)
-    return _ste_round(u) * scale
-
-# Global QAT state: id(module) -> (theta, qn, qp)
-_qat_state: dict[int, tuple[Tensor, int, int]] = {}
-_qat_global_active = False  # fast flag to avoid dict lookup when QAT off
-
-def set_qat_mode(base_model: nn.Module, clip_gammas: dict[str, Tensor], active: bool) -> None:
-    """Toggle QAT on/off for all quantizable modules."""
-    global _qat_global_active
-    _qat_global_active = active
-    _qat_state.clear()
-    if not active:
-        return
-    for name, module in base_model.named_modules():
-        if isinstance(module, CastedLinear):
-            param_name = name + ".weight"
-            if param_name in clip_gammas:
-                qn, qp = _get_quant_range(param_name)
-                _qat_state[id(module)] = (clip_gammas[param_name], qn, qp)
-    # Also handle BigramLogitHead
-    if hasattr(base_model, 'bigram_logit') and base_model.bigram_logit is not None:
-        if "bigram_logit.table" in clip_gammas:
-            _qat_state[id(base_model.bigram_logit)] = (clip_gammas["bigram_logit.table"], -8, 7)
-
-
 class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
-        if _qat_global_active:
-            # QAT path: fp32 fake-quant then cast down
-            w = self.weight.float()
-            qat = _qat_state.get(id(self))
-            if qat is not None:
-                theta, qn, qp = qat
-                w = _fake_quant_with_gamma(w, theta, qn, qp)
-            w = w.to(x.dtype)
-        else:
-            # Fast path: direct cast (matches SOTA speed)
-            w = self.weight.to(x.dtype)
+        w = self.weight.to(x.dtype)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
 
@@ -636,7 +579,8 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
+                 qk_gain_init: float, rope_dims: int = 0, use_xsa: bool = False):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -647,6 +591,9 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        self.use_xsa = use_xsa
+        # Partial RoPE: only rotate rope_dims dims (0 = all dims)
+        self.rope_dims = rope_dims if rope_dims > 0 else self.head_dim
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -654,7 +601,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rotary = Rotary(self.rope_dims, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -664,13 +611,27 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        # Partial RoPE: rotate only first rope_dims dims, leave rest untouched
+        rd = self.rope_dims
+        if rd < self.head_dim:
+            q_rot = apply_rotary_emb(q[..., :rd], cos, sin)
+            k_rot = apply_rotary_emb(k[..., :rd], cos, sin)
+            q = torch.cat([q_rot, q[..., rd:]], dim=-1)
+            k = torch.cat([k_rot, k[..., rd:]], dim=-1)
+        else:
+            q = apply_rotary_emb(q, cos, sin)
+            k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q, k, v, attn_mask=None, is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        # XSA: remove self-value component (token's own info already in residual)
+        if self.use_xsa:
+            vn = F.normalize(v, dim=-1)
+            if self.num_kv_heads != self.num_heads:
+                vn = vn.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+            y = y - (y * vn).sum(dim=-1, keepdim=True) * vn
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -684,7 +645,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
         return self.proj(x.square())
 
 
@@ -735,12 +696,7 @@ class BigramLogitHead(nn.Module):
         self.scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
     def forward(self, prev_tokens: Tensor) -> Tensor:
-        table = self.table.float()
-        qat = _qat_state.get(id(self))
-        if qat is not None:
-            theta, qn, qp = qat
-            table = _fake_quant_with_gamma(table, theta, qn, qp)
-        return table[prev_tokens] * self.scale
+        return self.table[prev_tokens] * self.scale
 
 
 def build_bigram_residual_init(
@@ -775,11 +731,13 @@ def build_bigram_residual_init(
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float, rope_base: float, qk_gain_init: float):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
+                 rope_base: float, qk_gain_init: float, rope_dims: int = 0, use_xsa: bool = False):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                                         rope_dims=rope_dims, use_xsa=use_xsa)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -811,6 +769,9 @@ class GPT(nn.Module):
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
         bigram_logit_head: bool = False,
+        xsa_last_n: int = 0,
+        rope_dims: int = 0,
+        ln_scale: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -818,6 +779,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.ln_scale = ln_scale
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.bigram_logit = BigramLogitHead(vocab_size) if bigram_logit_head else None
@@ -828,8 +790,10 @@ class GPT(nn.Module):
         self.smear = SmearGate(model_dim)
         self.blocks = nn.ModuleList(
             [
-                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-                for _ in range(num_layers)
+                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                      rope_dims=rope_dims,
+                      use_xsa=(i >= num_layers - xsa_last_n) if xsa_last_n > 0 else False)
+                for i in range(num_layers)
             ]
         )
         self.final_norm = RMSNorm()
@@ -862,11 +826,16 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
+            if self.ln_scale:
+                x = x * (1.0 / math.sqrt(i + 1))
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            bi = self.num_encoder_layers + i
+            x = self.blocks[bi](x, x0)
+            if self.ln_scale:
+                x = x * (1.0 / math.sqrt(bi + 1))
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -890,11 +859,16 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
+            if self.ln_scale:
+                x = x * (1.0 / math.sqrt(i + 1))
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            bi = self.num_encoder_layers + i
+            x = self.blocks[bi](x, x0)
+            if self.ln_scale:
+                x = x * (1.0 / math.sqrt(bi + 1))
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1083,9 +1057,12 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        bigram_vocab_size=0 if args.bigram_logit_head else args.bigram_vocab_size,
+        bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
         bigram_logit_head=args.bigram_logit_head,
+        xsa_last_n=args.xsa_last_n,
+        rope_dims=args.rope_dims,
+        ln_scale=args.ln_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1163,20 +1140,6 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
-    # QAT: create per-tensor clip multipliers
-    clip_gammas: dict[str, nn.Parameter] = {}
-    if args.qat_enabled:
-        for name, p in base_model.named_parameters():
-            if p.ndim == 2 and p.numel() > _QAT_CLIP_MIN_NUMEL:
-                clip_gammas[name] = nn.Parameter(torch.zeros(1, device=device, dtype=torch.float32))
-        if clip_gammas:
-            optimizer_gamma = torch.optim.Adam(
-                [{"params": list(clip_gammas.values()), "lr": args.qat_gamma_lr, "base_lr": args.qat_gamma_lr}],
-                betas=(0.9, 0.999),
-            )
-            optimizers.append(optimizer_gamma)
-            log0(f"qat:enabled gammas:{len(clip_gammas)} start_frac:{args.qat_start_frac}")
-
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1215,7 +1178,6 @@ def main() -> None:
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
-        initial_gamma_state = {k: v.detach().clone() for k, v in clip_gammas.items()}
         model.train()
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
@@ -1232,8 +1194,6 @@ def main() -> None:
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
         base_model.load_state_dict(initial_model_state, strict=True)
-        for k, v in initial_gamma_state.items():
-            clip_gammas[k].data.copy_(v)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
@@ -1244,9 +1204,14 @@ def main() -> None:
     # MAIN TRAINING LOOP
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    # SWA: stochastic weight averaging during warmdown
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
-    prev_qat_active: bool | None = None
+
+    # EMA: exponential moving average of parameters (not buffers)
+    ema_params: dict[str, Tensor] | None = None
+    if args.ema_enabled:
+        ema_params = {n: p.data.detach().clone() for n, p in base_model.named_parameters()}
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1281,14 +1246,6 @@ def main() -> None:
         train_frac = step / max(args.iterations, 1)
         scale = lr_mul(step, elapsed_ms)
 
-        # QAT: toggle only on transition
-        qat_active = args.qat_enabled and bool(clip_gammas) and train_frac >= args.qat_start_frac
-        if qat_active != prev_qat_active:
-            set_qat_mode(base_model, clip_gammas, qat_active)
-            prev_qat_active = qat_active
-            if qat_active:
-                log0(f"qat:activated at step:{step} frac:{train_frac:.3f}")
-
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1297,13 +1254,6 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
-            # QAT gamma regularization: log(γ)² toward 1.0
-            if qat_active and args.qat_gamma_reg > 0 and micro_step == grad_accum_steps - 1:
-                gamma_reg = torch.zeros((), device=device)
-                for theta in clip_gammas.values():
-                    gamma = 0.5 + torch.sigmoid(theta)
-                    gamma_reg = gamma_reg + torch.log(gamma).square().sum()
-                loss = loss + args.qat_gamma_reg * gamma_reg
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1319,12 +1269,6 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        # DDP: sync gamma grads before stepping
-        if distributed and clip_gammas:
-            for g in clip_gammas.values():
-                if g.grad is not None:
-                    dist.all_reduce(g.grad, op=dist.ReduceOp.SUM)
-                    g.grad.div_(world_size)
         for opt in optimizers:
             opt.step()
         zero_grad_all()
@@ -1342,6 +1286,12 @@ def main() -> None:
                 for name, t in base_model.state_dict().items():
                     swa_state[name] += t.detach().cpu()
                 swa_count += 1
+
+        # EMA: update exponential moving average every step
+        if ema_params is not None:
+            with torch.no_grad():
+                for n, p in base_model.named_parameters():
+                    ema_params[n].mul_(args.ema_decay).add_(p.data, alpha=1.0 - args.ema_decay)
 
         should_log_train = (
             args.train_log_every > 0
@@ -1376,15 +1326,13 @@ def main() -> None:
         }
         base_model.load_state_dict(avg_state, strict=True)
 
-    # Disable QAT before serialization and eval
-    set_qat_mode(base_model, clip_gammas, False)
-
-    # Extract learned gammas for final quantization
-    final_gammas: dict[str, float] = {}
-    if args.qat_enabled and clip_gammas:
-        for name, g in clip_gammas.items():
-            final_gammas[name] = float((0.5 + torch.sigmoid(g)).item())
-        log0(f"qat:final_gammas min={min(final_gammas.values()):.3f} max={max(final_gammas.values()):.3f}")
+    # Apply EMA weights (only if SWA not used)
+    if ema_params is not None and not (args.swa_enabled and swa_state is not None):
+        log0("ema:applying averaged weights")
+        with torch.no_grad():
+            for n, p in base_model.named_parameters():
+                if n in ema_params:
+                    p.data.copy_(ema_params[n])
 
     # SERIALIZATION + ROUNDTRIP VALIDATION
     if master_process:
@@ -1399,7 +1347,7 @@ def main() -> None:
     with torch.no_grad():
         for name, param in base_model.named_parameters():
             if param.ndim == 2 and param.numel() > 65536:
-                threshold = torch.quantile(param.abs().float().flatten(), 0.05)
+                threshold = torch.quantile(param.abs().float().flatten(), 0.03)
                 mask = param.abs() < threshold
                 param.masked_fill_(mask, 0.0)
 
@@ -1407,7 +1355,7 @@ def main() -> None:
     sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
     int4_names = {"bigram_logit.table"} if args.bigram_logit_head else set()
     quant_result, quant_meta = mixed_quantize_int6(
-        sd_cpu, {"mlp", "attn", "bigram"}, learned_gammas=final_gammas, int4_names=int4_names,
+        sd_cpu, {"mlp", "attn", "bigram"}, int4_names=int4_names,
     )
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)

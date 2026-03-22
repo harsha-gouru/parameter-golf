@@ -1,0 +1,102 @@
+================================================================================
+PARAMETER GOLF CHALLENGE - MARCH 2026 - EXECUTIVE RESEARCH SUMMARY
+================================================================================
+
+CHALLENGE OVERVIEW:
+- OpenAI Model Craft competition: Train best LM in 16MB (post-zlib) in 10min on 8xH100
+- Deadline: April 30, 2026
+- Prize: $1M in RunPod credits + OpenAI job interviews for top performers
+- Metric: Bits-Per-Byte (BPB) on FineWeb validation (lower is better)
+
+CURRENT LEADERBOARD (Late March 2026):
+1. 1.1539 BPB - OrthoInit + Int6 MLP3x + BigramHash + SmearGate (SOTA)
+2. 1.1594 BPB - Int6 MLP3x + STE QAT + Sliding Window
+3. 1.1666 BPB - Int6 + MLP 3x + STE QAT + NorMuon + Sliding Window
+Baseline: 1.2244 BPB (Naive GPT-2 + Int8 + zlib)
+
+WINNING RECIPE (Proven Techniques):
+✓ Int6 Quantization (not Int8, not BitNet 1.58-bit)
+✓ STE QAT (Straight-Through Estimator quantization-aware training)
+✓ OrthoInit (orthogonal weight initialization)
+✓ NorMuon Optimizer (faster convergence than AdamW)
+✓ MLP 3x Expansion (FFN hidden = 3x model dimension)
+✓ Sliding Window Attention (reduces compute)
+✓ BigramHash Embedding (aggressive compression)
+✓ SmearGate (proprietary technique in #1 entry - unknown mechanism)
+
+KEY INSIGHTS:
+1. Int6 beats Int8 and BitNet 1.58-bit for this specific metric (FineWeb BPB)
+   - Reason: 16MB compressed size constraint favors precision over extreme compression
+   
+2. All top 3 entries use standard Transformer (no recurrence, no MoE, no TTT)
+   - Means: Recurrence is UNEXPLOITED opportunity (+1-2% potential gains)
+   
+3. Time budget (10 min) allows 30-50 training steps with 8xH100
+   - Means: Fast initialization + fast optimizer critical
+   
+4. Embedding compression is the primary parameter budget lever
+   - BigramHash alone saves ~1-2% BPB
+   - SmearGate saves unknown amount (possibly 0.5-1%)
+
+UNEXPLOITED OPPORTUNITIES (Not in Leaderboard):
+- Depth Recurrence (LoopFormer, SpiralFormer) - 1-2% BPB potential
+- Knowledge Distillation pipeline - 0.5% BPB potential
+- Sparse-BitNet (1.58-bit + N:M sparsity) - 0.5% potential
+- KHA (Knocking-Heads Attention) - 0.5% potential
+- Cross-Layer KV Sharing - 0.3% potential
+
+WHAT'S NOT WORKING:
+✗ Full 1-bit BitNet (worse BPB than Int6 on FineWeb)
+✗ Test-Time Training (improves latency, not BPB)
+✗ MoE routing (routing overhead + 16MB constraint)
+✗ Very large MLP (>3x compresses worse)
+
+PARAMETER BUDGET BREAKDOWN:
+- Raw model size: ~32MB (assuming 0.5x zlib compression ratio)
+- Optimal param count: 25-35M parameters
+- Embedding: 0.5-1MB (with BigramHash)
+- Attention: 6-8MB
+- MLP: 12-16MB
+- Quantization metadata: 1-2MB
+- Code: 2-3MB
+
+IMMEDIATE NEXT STEPS (For Competitive Entry):
+Phase 1 (1 day): Replicate Int6 QAT + OrthoInit + NorMuon baseline
+                 Target: 1.17-1.18 BPB
+
+Phase 2 (2-3 days): Add BigramHash + reverse-engineer SmearGate
+                    Target: 1.15-1.16 BPB
+
+Phase 3 (1 week): Implement LoopFormer recurrence OR distillation pipeline
+                  Target: 1.14-1.15 BPB
+
+COMPETITIVE ADVANTAGES (You have):
+- ANE/Espresso compiler expertise (embedding compression tricks)
+- Qwen model tuning experience (init/optimizer knowledge)
+- Access to large training infrastructure
+- Orthogonal understanding of parameter-efficient training
+
+UNKNOWNS:
+- What SmearGate actually does (reverse-engineer or innovate beyond?)
+- Whether distillation helps (not stated in leaderboard)
+- Whether recurrence has been tried (no mention in public results)
+
+RECOMMENDED READING:
+1. STE QAT papers (Straight-Through Estimator variants) - PRIORITY
+2. OrthoInit + NorMuon optimization papers - PRIORITY
+3. LoopFormer (Jan 2026) - LOW PRIORITY (exploration only)
+4. Sparse-BitNet (March 2026) - LOW PRIORITY
+
+OFFICIAL RESOURCES:
+- GitHub: https://github.com/openai/parameter-golf
+- Submission format: Public Pull Requests with auto-evaluation
+- Compute subsidy: $1M in RunPod credits ($15-20 per 10-min 8xH100 job)
+
+FILING CABINET:
+- Full research summary: /Users/sriharshagouru/Developer/parameter-golf/RESEARCH_SUMMARY.md
+- Quick reference table: /Users/sriharshagouru/Developer/parameter-golf/TECHNIQUES_QUICK_REFERENCE.md
+- Obsidian note: /Users/sriharshagouru/Knowledge/Knowledge/Projects/Parameter Golf - Research Summary.md
+
+================================================================================
+Generated: March 19, 2026 | Research via Gemini web search | 11 technique categories analyzed
+================================================================================
