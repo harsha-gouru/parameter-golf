@@ -1,0 +1,8 @@
+{
+    "_name": "more_layers_11",
+    "_description": "11 layers instead of 9 with slightly narrower dim to fit budget",
+    "NUM_LAYERS": 11,
+    "MODEL_DIM": 448,
+    "NUM_HEADS": 8,
+    "NUM_KV_HEADS": 4
+}

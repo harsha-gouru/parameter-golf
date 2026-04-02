@@ -1,0 +1,5 @@
+{
+    "_name": "long_seq_2048",
+    "_description": "Train with 2048 seq len — better long-range patterns, same batch tokens",
+    "TRAIN_SEQ_LEN": 2048
+}

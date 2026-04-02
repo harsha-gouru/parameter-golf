@@ -1,0 +1,6 @@
+{
+    "_name": "early_qat",
+    "_description": "Start QAT earlier (50% instead of 75%) — more time for quant adaptation",
+    "QAT_START_FRAC": 0.5,
+    "QAT_RAMP_FRAC": 0.1
+}
